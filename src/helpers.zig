@@ -52,19 +52,22 @@ pub fn escapeFilename(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
         dest_len = max_dest_len;
 
     var dest = try allocator.alloc(u8, dest_len);
-    var wi: usize = dest_len - 1;
-    var ri: usize = src.len - 1;
 
-    while (true) {
-        dest[wi] = switch (src[ri]) {
-            'A'...'Z', 'a'...'z', '0'...'9', '.', '-', '_' => src[ri],
-            else => '#',
-        };
-        if (ri == 0 or wi == 0) {
-            break;
+    if (src.len > 0) {
+        var wi: usize = dest_len - 1;
+        var ri: usize = src.len - 1;
+
+        while (true) {
+            dest[wi] = switch (src[ri]) {
+                'A'...'Z', 'a'...'z', '0'...'9', '.', '-', '_' => src[ri],
+                else => '#',
+            };
+            if (ri == 0 or wi == 0) {
+                break;
+            }
+            wi -= 1;
+            ri -= 1;
         }
-        wi -= 1;
-        ri -= 1;
     }
 
     // hash djb2 (DJBX33A)
@@ -80,6 +83,10 @@ pub fn escapeFilename(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
 
 test "escape" {
     const allocator = std.testing.allocator;
+
+    const out_empty = try escapeFilename(allocator, "");
+    defer allocator.free(out_empty);
+    try std.testing.expectEqualStrings("15050000-", out_empty);
 
     const out = try escapeFilename(allocator, "/root/foo.c");
     defer allocator.free(out);
