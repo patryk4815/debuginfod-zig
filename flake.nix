@@ -21,7 +21,7 @@
         pkgs:
         (
           let
-            dev_zig = zig.packages.${pkgs.stdenv.hostPlatform.system}."master-2026-06-04" // {
+            dev_zig = zig.packages.${pkgs.stdenv.hostPlatform.system}."master-2026-06-19" // {
               meta = {
                 platforms = pkgs.lib.platforms.all;
                 broken = false;
