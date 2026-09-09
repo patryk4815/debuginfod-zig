@@ -1137,3 +1137,186 @@ test "stale negative marker is dropped and re-queried (respects cache_miss_s)" {
     defer allocator.free(marker);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, marker, .{}));
 }
+
+// --- Regression test for pwndbg/debuginfod-zig#9 -----------------------------
+//
+// Two clients (e.g. two GDB threads/processes sharing one cache) fetching the
+// same artifact at the same time must not write to the same temp file. With a
+// fixed `.tmp.<name>` path, client B's `O_TRUNC` open wipes what client A has
+// already written; A then keeps writing at its old offset, leaving a hole of
+// zeros at the start of the file it finally renames into place.
+//
+// The server below makes the interleaving deterministic:
+//   conn #1 (A): send first half, wait until conn #2 arrived, send second half
+//   conn #2 (B): wait until the test has inspected A's result, send everything
+// and the test only starts B once A's progress callback reports that at least
+// half of the body has been streamed into A's temp file.
+
+const RaceServerState = struct {
+    conn_count: std.atomic.Value(u32) = .init(0),
+    // Bytes client A has streamed into its temp file (from its progress callback).
+    a_written: std.atomic.Value(usize) = .init(0),
+    // Set once connection #2 (client B) has been accepted: unblocks A's second half.
+    second_conn_arrived: std.atomic.Value(bool) = .init(false),
+    // Set once the test has inspected A's result: unblocks B's body.
+    release_second: std.atomic.Value(bool) = .init(false),
+};
+
+fn testRaceProgressFn(handle: ?*DebuginfodContext, current: c_long, total: c_long) callconv(.c) c_int {
+    _ = total;
+    const state: *RaceServerState = @ptrCast(@alignCast(handle.?.current_userdata.?));
+    state.a_written.store(@intCast(@max(current, 0)), .release);
+    return 0;
+}
+
+fn testStartRaceServer(io: std.Io, file_blob: []const u8, queue: *std.Io.Queue(u16), state: *RaceServerState) !void {
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var socket = try address.listen(io, .{});
+    defer socket.deinit(io);
+    try queue.putOne(io, socket.socket.address.getPort());
+
+    // Unlike testStartServer, connections are served concurrently: the test
+    // needs both requests in flight at once.
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+
+    while (true) {
+        const conn = socket.accept(io) catch break;
+        const conn_no = state.conn_count.fetchAdd(1, .acq_rel) + 1;
+        try group.concurrent(io, testHandleRaceConnection, .{ io, conn, file_blob, conn_no, state });
+    }
+}
+
+// Group.concurrent only accepts Cancelable!void: report any other handler
+// error to stderr (the client side of the test will fail loudly anyway).
+fn testHandleRaceConnection(io: std.Io, stream: std.Io.net.Stream, file_blob: []const u8, conn_no: u32, state: *RaceServerState) std.Io.Cancelable!void {
+    testHandleRaceConnectionInner(io, stream, file_blob, conn_no, state) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => std.debug.print("race test http handler #{d} error: {}\n", .{ conn_no, err }),
+    };
+}
+
+fn testHandleRaceConnectionInner(io: std.Io, stream: std.Io.net.Stream, file_blob: []const u8, conn_no: u32, state: *RaceServerState) !void {
+    defer stream.close(io);
+
+    var req_buf: [2048]u8 = undefined;
+    var conn_reader = stream.reader(io, &req_buf);
+    var conn_writer = stream.writer(io, &req_buf);
+    var http_server = std.http.Server.init(&conn_reader.interface, &conn_writer.interface);
+    var req = try http_server.receiveHead();
+
+    var send_buffer: [4096]u8 = undefined;
+    var res = try req.respondStreaming(&send_buffer, .{
+        .content_length = file_blob.len,
+        .respond_options = .{
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/octet-stream" },
+            },
+        },
+    });
+
+    const half = file_blob.len / 2;
+    switch (conn_no) {
+        1 => {
+            try res.writer.writeAll(file_blob[0..half]);
+            try res.writer.flush();
+            while (!state.second_conn_arrived.load(.acquire)) try io.sleep(.fromMilliseconds(10), .awake);
+            try res.writer.writeAll(file_blob[half..]);
+        },
+        2 => {
+            state.second_conn_arrived.store(true, .release);
+            while (!state.release_second.load(.acquire)) try io.sleep(.fromMilliseconds(10), .awake);
+            try res.writer.writeAll(file_blob);
+        },
+        else => return error.UnexpectedExtraConnection,
+    }
+    try res.writer.flush();
+    try res.end();
+}
+
+// Check that a find* result is a path to a file holding exactly `expected`.
+// On mismatch, print how the file is corrupt (a zero-hole is the #9 symptom).
+fn testExpectFetchedFile(io: std.Io, allocator: std.mem.Allocator, label: []const u8, result: anyerror![]u8, expected: []const u8) !void {
+    const path = result catch |err| {
+        std.debug.print("client {s}: fetch failed: {}\n", .{ label, err });
+        return err;
+    };
+    defer allocator.free(path);
+
+    const content = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited);
+    defer allocator.free(content);
+    if (std.mem.eql(u8, content, expected)) return;
+
+    var zeros: usize = 0;
+    for (content) |c| {
+        if (c == 0) zeros += 1;
+    }
+    std.debug.print("client {s}: fetched file is corrupt: len={d} (want {d}), zero bytes={d}, first mismatch at offset {?d}\n", .{
+        label, content.len, expected.len, zeros, std.mem.indexOfDiff(u8, content, expected),
+    });
+    return error.CorruptedDownload;
+}
+
+test "concurrent fetches of the same artifact do not clobber each other's temp file (issue #9)" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Large enough that most of the first half is already flushed to disk
+    // (fetchAsFile buffers 64 KiB) when client B truncates the temp file.
+    // Every byte is non-zero so a hole of zeros is unmistakable.
+    const blob = try allocator.alloc(u8, 512 * 1024);
+    defer allocator.free(blob);
+    for (blob, 0..) |*b, i| b.* = @intCast(i % 251 + 1);
+
+    var state: RaceServerState = .{};
+    var queue_buf: [1]u16 = undefined;
+    var queue: std.Io.Queue(u16) = .init(&queue_buf);
+    var server = try io.concurrent(testStartRaceServer, .{ io, blob, &queue, &state });
+    defer server.cancel(io) catch {};
+    const port = try queue.getOne(io);
+
+    var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = tmp_path_buf[0..try tmp_dir.dir.realPath(std.testing.io, &tmp_path_buf)];
+    const urls = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port});
+    defer allocator.free(urls);
+
+    // Two independent clients sharing one cache directory.
+    var ctxs: [2]*DebuginfodContext = undefined;
+    for (&ctxs) |*ctx| {
+        var penvs = try helpers.getEnvMap(allocator);
+        defer penvs.deinit();
+        try penvs.put("DEBUGINFOD_URLS", urls);
+        try penvs.put("DEBUGINFOD_CACHE_PATH", tmp_path);
+        ctx.* = try DebuginfodContext.init(allocator, penvs);
+    }
+    defer for (ctxs) |ctx| ctx.deinit();
+    const ctx_a = ctxs[0];
+    const ctx_b = ctxs[1];
+
+    ctx_a.progress_fn = @constCast(&testRaceProgressFn);
+    ctx_a.current_userdata = &state;
+
+    const build_id = "5c9d8b11851246b7766f0a7b3042a8988faad435";
+
+    var fut_a = try io.concurrent(DebuginfodContext.findDebuginfo, .{ ctx_a, build_id });
+    // Wait until A has streamed at least half of the body into its temp file.
+    while (state.a_written.load(.acquire) < blob.len / 2) try io.sleep(.fromMilliseconds(10), .awake);
+
+    // B now opens its temp file and connects; the connection unblocks A's
+    // second half, so A finishes (and renames) while B is still waiting.
+    var fut_b = try io.concurrent(DebuginfodContext.findDebuginfo, .{ ctx_b, build_id });
+
+    const verdict_a = testExpectFetchedFile(io, allocator, "A", fut_a.await(io), blob);
+
+    // Whatever A looked like, let B run to completion before judging.
+    state.release_second.store(true, .release);
+    const result_b = fut_b.await(io);
+
+    try verdict_a;
+    try testExpectFetchedFile(io, allocator, "B", result_b, blob);
+}
