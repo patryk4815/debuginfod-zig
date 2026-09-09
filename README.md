@@ -27,7 +27,6 @@ zig build -Dtarget=aarch64-macos -Doptimize=ReleaseSafe -Dlinkage=dynamic
 `zig build` also produces `zig-out/bin/debuginfod-find`, a CLI with the same command line as
 elfutils' `debuginfod-find` (built directly on `src/client.zig`, no C ABI involved):
 ```
-export DEBUGINFOD_URLS="https://debuginfod.debian.net"   # optional, defaults to https://debuginfod.pwndbg.re
 debuginfod-find debuginfo bea6a154d9a9158114ee0a2a439045596615df14   # by hex build-id
 debuginfod-find executable /usr/bin/bash                             # by ELF path (build-id read from the .note.gnu.build-id)
 debuginfod-find source bea6a154d9a9158114ee0a2a439045596615df14 /usr/src/debug/bash/shell.c
