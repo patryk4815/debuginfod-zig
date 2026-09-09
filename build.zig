@@ -61,11 +61,41 @@ pub fn build(b: *std.Build) !void {
     lib.step.dependOn(&pkgconfig.step);
     b.installArtifact(lib);
 
+    // `debuginfod-find` CLI (see issue #8): thin wrapper over client.zig with
+    // the same command line as elfutils' debuginfod-find.
+    const find_mod = b.createModule(.{
+        .root_source_file = b.path("src/find.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    find_mod.addImport("build.zig.zon", zon_module);
+    const find_exe = b.addExecutable(.{
+        .name = "debuginfod-find",
+        .root_module = find_mod,
+        .version = version,
+    });
+    b.installArtifact(find_exe);
+
+    const run_find = b.addRunArtifact(find_exe);
+    run_find.addPassthruArgs();
+    const run_step = b.step("run", "Run debuginfod-find (pass args after `--`)");
+    run_step.dependOn(&run_find.step);
+
     const lib_unit_tests = b.addTest(.{
         .root_module = lib_mod,
     });
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
     b.installArtifact(lib_unit_tests);
+
+    const find_unit_tests = b.addTest(.{
+        .name = "test-find",
+        .root_module = find_mod,
+    });
+    const run_find_unit_tests = b.addRunArtifact(find_unit_tests);
+    b.installArtifact(find_unit_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
+    test_step.dependOn(&run_find_unit_tests.step);
 }

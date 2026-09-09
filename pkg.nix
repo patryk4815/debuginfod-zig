@@ -62,6 +62,8 @@ stdenv.mkDerivation {
     lib.optionalString isSameOS ''
       echo "Starting tests..."
       ${qemu} ${ld} $out/bin/test
+      ${qemu} ${ld} $out/bin/test-find
+      ${qemu} ${ld} $out/bin/debuginfod-find --version
     '';
 
   # Allow tests that bind or connect to localhost on macOS.

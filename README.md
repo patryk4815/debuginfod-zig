@@ -24,6 +24,22 @@ zig build -Dtarget=x86_64-macos -Doptimize=ReleaseSafe -Dlinkage=dynamic
 zig build -Dtarget=aarch64-macos -Doptimize=ReleaseSafe -Dlinkage=dynamic
 ```
 
+`zig build` also produces `zig-out/bin/debuginfod-find`, a CLI with the same command line as
+elfutils' `debuginfod-find` (built directly on `src/client.zig`, no C ABI involved):
+```
+export DEBUGINFOD_URLS="https://debuginfod.debian.net"   # optional, defaults to https://debuginfod.pwndbg.re
+debuginfod-find debuginfo bea6a154d9a9158114ee0a2a439045596615df14   # by hex build-id
+debuginfod-find executable /usr/bin/bash                             # by ELF path (build-id read from the .note.gnu.build-id)
+debuginfod-find source bea6a154d9a9158114ee0a2a439045596615df14 /usr/src/debug/bash/shell.c
+debuginfod-find section /usr/bin/bash .text
+debuginfod-find -v debuginfo ...                                     # log + download progress on stderr
+
+# from the source tree:
+zig build run -- debuginfo bea6a154d9a9158114ee0a2a439045596615df14
+```
+On success the path of the cached file is printed on stdout (exit 0); otherwise
+`Server query failed: ...` goes to stderr (exit 1). `metadata` queries are not implemented.
+
 ## How to replace GDB debuginfod with this repo?
 ```
 nix build github:pwndbg/debuginfod-zig#dynamic
