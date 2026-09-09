@@ -499,10 +499,17 @@ pub const DebuginfodContext = struct {
         return try self.findSection(build_id, section);
     }
 
-    fn getTempFilepath(allocator: std.mem.Allocator, local_path: []const u8) ![]u8 {
+    // Unique per-call temp path next to `local_path`: `.tmp.<name>.<64-bit hex>`.
+    // Concurrent fetches of the same artifact (two GDB threads/processes on one
+    // cache) must never share a temp file, or one truncates the other's partial
+    // download (issue #9). The random suffix mirrors mkstemp; the caller opens it
+    // O_EXCL so a collision fails instead of clobbering.
+    fn getTempFilepath(allocator: std.mem.Allocator, io: std.Io, local_path: []const u8) ![]u8 {
         const local_dirname = std.fs.path.dirname(local_path) orelse return error.InvalidLocalPath;
-        // todo: security? random filename?
-        const tmp_basename = try std.mem.concat(allocator, u8, &.{ ".tmp.", std.fs.path.basename(local_path) });
+
+        var rand: [8]u8 = undefined;
+        io.random(&rand);
+        const tmp_basename = try std.fmt.allocPrint(allocator, ".tmp.{s}.{x}", .{ std.fs.path.basename(local_path), rand });
         defer allocator.free(tmp_basename);
 
         return try std.fs.path.join(allocator, &.{ local_dirname, tmp_basename });
@@ -551,16 +558,19 @@ pub const DebuginfodContext = struct {
         const io = self.getIo();
 
         const local_dirname = std.fs.path.dirname(local_path) orelse return error.InvalidLocalPath;
-        const local_path_tmp = try getTempFilepath(self.allocator, local_path);
+        const local_path_tmp = try getTempFilepath(self.allocator, io, local_path);
         defer self.allocator.free(local_path_tmp);
 
         try std.Io.Dir.cwd().createDirPath(io, local_dirname);
 
+        var file = try std.Io.Dir.createFileAbsolute(io, local_path_tmp, .{
+            .exclusive = true,
+        });
+        // Only after O_EXCL succeeded is the temp file ours to delete (a
+        // colliding name belongs to another in-flight fetch). Covers both a
+        // failed download and a failed rename below.
         errdefer std.Io.Dir.deleteFileAbsolute(io, local_path_tmp) catch {};
         {
-            var file = try std.Io.Dir.createFileAbsolute(io, local_path_tmp, .{
-                .truncate = true,
-            });
             defer file.close(io);
 
             var buffer: [64 * 1024]u8 = undefined;
