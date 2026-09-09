@@ -52,9 +52,16 @@ pub fn findBuildIdInNotes(allocator: std.mem.Allocator, blob: []const u8, endian
     while (true) {
         const nhdr = r.takeStruct(std.elf.Elf64_Nhdr, endian) catch return null;
 
+        // Bounds-check against what is left *before* handing sizes to the
+        // reader: `Reader.fill` computes `seek + n` in usize, which overflows
+        // (panics) on 32-bit targets for a garbage n_namesz like 0xffffffff.
+        // Bounded sizes also keep `padding` (alignForward) overflow-free.
+        if (nhdr.n_namesz > r.buffered().len) return null;
         const name = r.take(nhdr.n_namesz) catch return null;
+        if (padding(nhdr.n_namesz) > r.buffered().len) return null;
         r.discardAll(padding(nhdr.n_namesz)) catch return null;
 
+        if (nhdr.n_descsz > r.buffered().len) return null;
         const desc = r.take(nhdr.n_descsz) catch return null;
         // The last note's desc padding may be absent; tolerate that.
         r.discardAll(@min(padding(nhdr.n_descsz), r.buffered().len)) catch return null;
@@ -100,7 +107,14 @@ test "findBuildIdInNotes: wrong owner / no note / garbage" {
     try std.testing.expectEqual(null, try findBuildIdInNotes(allocator, blob.written(), endian));
 
     try std.testing.expectEqual(null, try findBuildIdInNotes(allocator, "", endian));
+    // n_namesz/n_descsz = 0xffffffff: must bail out, not overflow (32-bit usize).
     try std.testing.expectEqual(null, try findBuildIdInNotes(allocator, "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff", endian));
+    // Truncated: header claims more name/desc bytes than the blob holds.
+    var trunc = std.Io.Writer.Allocating.init(allocator);
+    defer trunc.deinit();
+    try trunc.writer.writeStruct(std.elf.Elf64_Nhdr{ .n_namesz = 4, .n_descsz = 0xfffffff0, .n_type = std.elf.NT_GNU_BUILD_ID }, endian);
+    try trunc.writer.writeAll("GNU\x00\x01\x02");
+    try std.testing.expectEqual(null, try findBuildIdInNotes(allocator, trunc.written(), endian));
 }
 
 test "readBuildIdHex: synthetic ELF64 with .note.gnu.build-id section" {
